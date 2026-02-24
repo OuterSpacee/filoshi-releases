@@ -1,0 +1,137 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Filoshi — Missing Binaries Builder (macOS & Linux)
+# ═══════════════════════════════════════════════════════════════════════════
+
+name: Build Missing Binaries
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 1. macOS Binaries (Silicon & Intel) - Fast Extraction Method
+  # ═══════════════════════════════════════════════════════════════════════════
+  macos-binaries:
+    runs-on: macos-14  # Fast ARM runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download & Install MacTeX Ghostscript
+        run: |
+          echo "Downloading official MacTeX Ghostscript Universal Installer..."
+          curl -L -O https://pages.uoregon.edu/koch/Ghostscript-10.04.0.pkg
+          
+          echo "Installing silently..."
+          sudo installer -pkg Ghostscript-10.04.0.pkg -target /
+
+      - name: Extract Intel and Silicon Binaries
+        run: |
+          echo "Extracting the Intel (x86_64) architecture..."
+          lipo -thin x86_64 /usr/local/bin/gs -output gs-x86_64-apple-darwin
+          
+          echo "Extracting the Silicon (arm64) architecture..."
+          lipo -thin arm64 /usr/local/bin/gs -output gs-aarch64-apple-darwin
+          
+          chmod +x gs-x86_64-apple-darwin gs-aarch64-apple-darwin
+          
+          echo "=== Verifying Architectures ==="
+          file gs-x86_64-apple-darwin
+          file gs-aarch64-apple-darwin
+
+      - name: Upload macOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries
+          path: |
+            gs-x86_64-apple-darwin
+            gs-aarch64-apple-darwin
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 2. Linux Binaries - Compile Method (Using your working config)
+  # ═══════════════════════════════════════════════════════════════════════════
+  linux-binaries:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
+            libtiff-dev libjpeg-dev libpng-dev libfreetype6-dev liblcms2-dev \
+            libopenjp2-7-dev libxml2-dev zlib1g-dev
+
+      - name: Build Ghostscript for Linux
+        run: |
+          cd /tmp
+          curl -L "https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10040/ghostscript-10.04.0.tar.gz" -o gs.tar.gz
+          tar -xzf gs.tar.gz
+          cd ghostscript-10.04.0
+          ./configure --prefix=/tmp/install --disable-cups --disable-gtk --without-x --disable-shared --enable-static
+          make -j$(nproc)
+          make install
+          cp /tmp/install/bin/gs $GITHUB_WORKSPACE/gs-x86_64-unknown-linux-gnu
+          chmod +x $GITHUB_WORKSPACE/gs-x86_64-unknown-linux-gnu
+
+      - name: Build ImageMagick for Linux
+        run: |
+          cd /tmp
+          curl -L "https://imagemagick.org/archive/releases/ImageMagick-7.1.2-15.tar.gz" -o im.tar.gz
+          tar -xzf im.tar.gz
+          cd ImageMagick-7.1.2-15
+          ./configure --prefix=/tmp/im-install \
+            --disable-shared --enable-static \
+            --without-x --without-perl --without-magick-plus-plus \
+            --without-fftw --without-flif --without-fpx --without-djvu \
+            --without-raqm --without-wmf --without-gvc --without-openexr \
+            --without-heic --without-jbig --without-lqr --without-lzma
+          make -j$(nproc)
+          make install
+          cp /tmp/im-install/bin/magick $GITHUB_WORKSPACE/magick-x86_64-unknown-linux-gnu
+          chmod +x $GITHUB_WORKSPACE/magick-x86_64-unknown-linux-gnu
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            gs-x86_64-unknown-linux-gnu
+            magick-x86_64-unknown-linux-gnu
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 3. Create GitHub Release
+  # ═══════════════════════════════════════════════════════════════════════════
+  release:
+    needs: [macos-binaries, linux-binaries]
+    runs-on: ubuntu-latest
+    if: always() && needs.macos-binaries.result == 'success' && needs.linux-binaries.result == 'success'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./binaries
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./binaries/*
+          tag_name: final-binaries-${{ github.run_number }}
+          name: "Filoshi Missing Binaries #${{ github.run_number }}"
+          body: |
+            Here are the 4 missing cross-platform binaries ready for download.
+            
+            ### Included Binaries (No extensions needed):
+            - `gs-aarch64-apple-darwin` (Ghostscript Mac Silicon)
+            - `gs-x86_64-apple-darwin` (Ghostscript Mac Intel)
+            - `gs-x86_64-unknown-linux-gnu` (Ghostscript Linux)
+            - `magick-x86_64-unknown-linux-gnu` (ImageMagick Linux)
+            
+            ### Instructions
+            Place these files in `apps/desktop/src-tauri/binaries/` alongside your existing Windows `.exe` files.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
