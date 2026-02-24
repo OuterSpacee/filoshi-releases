@@ -1,52 +1,75 @@
-<p align="center">
-  <img src="https://filoshi.com/logo-white.svg" alt="Filoshi" width="160" />
-</p>
+# Filoshi Cross-Platform Binary Builder
 
-<h1 align="center">Filoshi — Private File Converter</h1>
+This repository builds cross-platform binaries for the Filoshi desktop app.
 
-<p align="center">
-  Convert video, audio, images, and documents — 100% private.<br/>
-  No uploads. No cloud. No tracking.
-</p>
+## 📋 What This Builds
 
-<p align="center">
-  <a href="https://filoshi.com">🌐 Website</a> •
-  <a href="https://github.com/OuterSpacee/filoshi-releases/releases/latest">⬇️ Download</a>
-</p>
+| Binary | Platform | Source |
+|--------|----------|--------|
+| `gs-x86_64-apple-darwin` | macOS Intel | Built from Ghostscript 10.04.0 source |
+| `gs-aarch64-apple-darwin` | macOS ARM (Apple Silicon) | Built from Ghostscript 10.04.0 source |
+| `gs-x86_64-unknown-linux-gnu` | Linux x86_64 | Built from Ghostscript 10.04.0 source |
+| `magick-x86_64-unknown-linux-gnu` | Linux x86_64 | Built from ImageMagick 7.1.2-15 source |
 
----
+## 🚀 How to Use
 
-## Downloads
+### Option 1: Manual Trigger (Recommended)
+1. Push this repository to GitHub
+2. Go to **Actions** tab
+3. Select **"Build Cross-Platform Binaries"**
+4. Click **"Run workflow"**
+5. Wait ~15-20 minutes for builds to complete
+6. Download binaries from the created release
 
-Head over to the [**Releases**](https://github.com/OuterSpacee/filoshi-releases/releases/latest) page to download the latest version for your platform:
+### Option 2: Tag Push
+Push a tag like `binaries-v1.0.0` to trigger automatic build:
+```bash
+git tag binaries-v1.0.0
+git push origin binaries-v1.0.0
+```
 
-| Platform | File |
-|----------|------|
-| **Windows** | `.exe` installer |
-| **macOS** | `.dmg` disk image |
-| **Linux** | `.AppImage` or `.deb` package |
+## 📦 After Build
 
-## Features
+Binaries will be available in GitHub Releases:
+- Go to your repo's **Releases** page
+- Download the release assets
+- Extract and place in `filoshi/apps/desktop/src-tauri/binaries/`
+- **Remove file extensions** (Linux/macOS binaries don't use `.exe`)
 
-- 🔒 **100% Offline** — All conversions happen locally on your machine
-- ⚡ **4000+ Formats** — Video, audio, image, and document support
-- ✂️ **Built-in Editor** — Crop, resize, trim, and adjust before converting
-- 📦 **Batch Processing** — Convert unlimited files at once
-- 🔄 **Auto Updates** — Stay on the latest version automatically
+## ⚙️ Build Details
 
-## System Requirements
+### macOS Builds
+- **Intel**: Runs on `macos-13` (x86_64)
+- **ARM**: Runs on `macos-14` (M1/M2 Apple Silicon)
+- **Dependencies**: Installed via Homebrew
+- **Build**: Static linking with `--disable-shared --enable-static`
 
-- **Windows**: Windows 10 or later
-- **macOS**: macOS 11 (Big Sur) or later
-- **Linux**: Ubuntu 22.04+ or equivalent
+### Linux Build
+- **Runner**: `ubuntu-22.04` (x86_64)
+- **Dependencies**: Installed via apt
+- **Build**: Static linking for portability
 
-## License
+## 🔧 Customization
 
-Filoshi Desktop requires a commercial license key ($14.90, one-time).  
-Purchase at [filoshi.com](https://filoshi.com).
+To change versions, edit these lines in `.github/workflows/build-binaries.yml`:
+```yaml
+env:
+  GHOSTSCRIPT_VERSION: "10.04.0"      # Change Ghostscript version
+  IMAGEMAGICK_VERSION: "7.1.2-15"      # Change ImageMagick version
+```
 
----
+## ⏱️ Build Times
 
-<p align="center">
-  Built by <a href="https://synvor.com">Synvor Ltd</a>
-</p>
+| Job | Estimated Time |
+|-----|----------------|
+| macOS Intel | ~8-10 minutes |
+| macOS ARM | ~8-10 minutes |
+| Linux | ~10-15 minutes |
+| **Total** | **~15-20 minutes** |
+
+## 📝 Notes
+
+- Binaries are statically linked for portability
+- No external dependencies required on target systems
+- Built with minimal features (no X11, no CUPS, etc.) for smaller size
+- GitHub Actions runners are free for public repositories
