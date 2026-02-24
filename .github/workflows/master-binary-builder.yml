@@ -1,0 +1,284 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Filoshi — The Ultimate Master Binary Builder (Separated & Organized)
+# Marketed for Maximum Format Support (Full FFmpeg Builds included)
+# ═══════════════════════════════════════════════════════════════════════════
+
+name: Build ALL Final Binaries
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+permissions:
+  contents: write  # Allows the bot to create the Release page
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 1. WINDOWS BINARIES (x86_64)
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download & Extract Windows Binaries
+        shell: pwsh
+        run: |
+          # 1. 7-Zip
+          Invoke-WebRequest -Uri "https://www.7-zip.org/a/7z2409-extra.7z" -OutFile "7z_extra.7z"
+          7z x 7z_extra.7z -o7z_out -y
+          Copy-Item "7z_out\7za.exe" "7z-x86_64-pc-windows-msvc.exe"
+
+          # 2. FFmpeg (FULL Build)
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z" -OutFile "ffmpeg.7z"
+          7z x ffmpeg.7z -offmpeg_out -y
+          $ffmpeg = Get-ChildItem -Path "ffmpeg_out" -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+          Copy-Item $ffmpeg.FullName "ffmpeg-x86_64-pc-windows-msvc.exe"
+
+          # 3. ImageMagick (Bulletproof 3-Tier Fallback Strategy)
+          Write-Host "Downloading ImageMagick..."
+          $success = $false
+          
+          # Strategy 1: Scrape official download page
+          try {
+              $html = (Invoke-WebRequest -Uri "https://imagemagick.org/script/download.php" -UseBasicParsing).Content
+              $im_file = [regex]::Match($html, 'ImageMagick-7\.[0-9]+\.[0-9]+-[0-9]+-portable-Q16-x64\.zip').Value
+              if ($im_file) {
+                  Write-Host "Strategy 1 Success: Found $im_file"
+                  Invoke-WebRequest -Uri "https://imagemagick.org/archive/binaries/$im_file" -OutFile "magick.zip"
+                  $success = $true
+              }
+          } catch { Write-Host "Strategy 1 failed." }
+
+          # Strategy 2: GitHub API tag parsing
+          if (-not $success) {
+              try {
+                  $tag = (Invoke-RestMethod -Uri "https://api.github.com/repos/ImageMagick/ImageMagick/releases/latest").tag_name
+                  $url = "https://imagemagick.org/archive/binaries/ImageMagick-$tag-portable-Q16-x64.zip"
+                  Write-Host "Strategy 2: Trying GitHub tag URL: $url"
+                  Invoke-WebRequest -Uri $url -OutFile "magick.zip"
+                  $success = $true
+              } catch { Write-Host "Strategy 2 failed." }
+          }
+          
+          # Strategy 3: Download Official Installer from GitHub and Extract it Silently
+          if (-not $success) {
+              try {
+                  Write-Host "Strategy 3: Using GitHub Installer"
+                  $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ImageMagick/ImageMagick/releases/latest"
+                  $asset = $release.assets | Where-Object { $_.name -match 'Q16-x64-dll\.exe$' } | Select-Object -First 1
+                  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "im_setup.exe"
+                  Start-Process -FilePath ".\im_setup.exe" -ArgumentList "/VERYSILENT /DIR=$PWD\magick_out /SUPPRESSMSGBOXES /NORESTART" -Wait -NoNewWindow
+                  $success = $true
+              } catch { Write-Host "Strategy 3 failed." }
+          }
+
+          # Extract ZIP if Strategy 1 or 2 worked
+          if (Test-Path "magick.zip") {
+              Expand-Archive -Path "magick.zip" -DestinationPath "magick_out" -Force
+          }
+          
+          # Copy the magick.exe and any required DLLs
+          Copy-Item "magick_out\magick.exe" "magick-x86_64-pc-windows-msvc.exe"
+          if (Test-Path "magick_out\*.dll") {
+              Copy-Item "magick_out\*.dll" "."
+          }
+
+          # 4. Pandoc
+          Invoke-WebRequest -Uri "https://github.com/jgm/pandoc/releases/download/3.6.2/pandoc-3.6.2-windows-x86_64.zip" -OutFile "pandoc.zip"
+          Expand-Archive -Path "pandoc.zip" -DestinationPath "pandoc_out" -Force
+          $pandoc = Get-ChildItem -Path "pandoc_out" -Filter "pandoc.exe" -Recurse | Select-Object -First 1
+          Copy-Item $pandoc.FullName "pandoc-x86_64-pc-windows-msvc.exe"
+
+          # 5. Ghostscript (Extracting .exe AND .dll)
+          Invoke-WebRequest -Uri "https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10040/gs10040w64.exe" -OutFile "gs.exe"
+          7z x gs.exe -ogs_out -y
+          Copy-Item "gs_out\bin\gswin64c.exe" "gswin64c-x86_64-pc-windows-msvc.exe"
+          Copy-Item "gs_out\bin\gsdll64.dll" "gsdll64.dll"
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            *-windows-msvc.exe
+            *.dll
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 2. LINUX BINARIES (x86_64)
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
+            libtiff-dev libjpeg-dev libpng-dev libfreetype6-dev liblcms2-dev libopenjp2-7-dev libxml2-dev zlib1g-dev
+
+      - name: Build Ghostscript
+        run: |
+          curl -L "https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10040/ghostscript-10.04.0.tar.gz" -o gs.tar.gz
+          tar -xzf gs.tar.gz
+          cd ghostscript-10.04.0
+          ./configure --prefix=/tmp/install --disable-cups --disable-gtk --without-x --disable-shared --enable-static
+          make -j$(nproc)
+          make install
+          cp /tmp/install/bin/gs ../gs-x86_64-unknown-linux-gnu
+
+      - name: Build ImageMagick
+        run: |
+          curl -L "https://imagemagick.org/archive/ImageMagick.tar.gz" -o im.tar.gz
+          tar -xzf im.tar.gz
+          cd ImageMagick-*
+          ./configure --prefix=/tmp/im-install --disable-shared --enable-static --without-x --without-perl --without-magick-plus-plus --without-fftw
+          make -j$(nproc)
+          make install
+          cp /tmp/im-install/bin/magick ../magick-x86_64-unknown-linux-gnu
+          cd ..
+
+      - name: Get FFmpeg & Pandoc
+        run: |
+          curl -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          cp ffmpeg-*-amd64-static/ffmpeg ffmpeg-x86_64-unknown-linux-gnu
+          
+          curl -L "https://github.com/jgm/pandoc/releases/download/3.6.2/pandoc-3.6.2-linux-amd64.tar.gz" -o pandoc.tar.gz
+          tar -xzf pandoc.tar.gz
+          cp pandoc-3.6.2/bin/pandoc pandoc-x86_64-unknown-linux-gnu
+          
+          chmod +x *-unknown-linux-gnu
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: '*-unknown-linux-gnu'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 3. macOS ARM BINARIES (Silicon / M1/M2/M3)
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-macos-arm:
+    runs-on: macos-14  # Apple Silicon Runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Build Tools
+        run: brew install autoconf automake libtool pkg-config libjpeg libpng libtiff
+
+      - name: Get Ghostscript (Silicon via MacTeX Extraction)
+        run: |
+          curl -L -O https://pages.uoregon.edu/koch/Ghostscript-10.04.0.pkg
+          sudo installer -pkg Ghostscript-10.04.0.pkg -target /
+          lipo -thin arm64 /usr/local/bin/gs -output gs-aarch64-apple-darwin
+
+      - name: Get FFmpeg & Pandoc (Silicon)
+        run: |
+          curl -L "https://www.osxexperts.net/ffmpeg7arm.zip" -o ffmpeg_arm.zip
+          unzip -q ffmpeg_arm.zip
+          mv ffmpeg ffmpeg-aarch64-apple-darwin
+          
+          curl -L "https://github.com/jgm/pandoc/releases/download/3.6.2/pandoc-3.6.2-arm64-macOS.zip" -o pandoc_arm.zip
+          unzip -q pandoc_arm.zip -d pandoc_arm
+          mv pandoc_arm/pandoc-*/bin/pandoc pandoc-aarch64-apple-darwin
+
+      - name: Build ImageMagick (Native Silicon)
+        run: |
+          curl -L "https://imagemagick.org/archive/ImageMagick.tar.gz" -o im.tar.gz
+          tar -xzf im.tar.gz
+          cd ImageMagick-*
+          ./configure --prefix=/tmp/im-arm --disable-shared --enable-static --without-x --without-magick-plus-plus --without-perl
+          make -j$(sysctl -n hw.ncpu)
+          make install
+          cp /tmp/im-arm/bin/magick ../magick-aarch64-apple-darwin
+          cd ..
+          
+          chmod +x *-apple-darwin
+
+      - name: Upload macOS ARM Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm-binaries
+          path: '*-aarch64-apple-darwin'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 4. macOS INTEL BINARIES (x86_64)
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-macos-intel:
+    runs-on: macos-15-intel  # Dedicated Intel Runner!
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Build Tools
+        run: brew install autoconf automake libtool pkg-config libjpeg libpng libtiff
+
+      - name: Get Ghostscript (Intel via MacTeX Extraction)
+        run: |
+          curl -L -O https://pages.uoregon.edu/koch/Ghostscript-10.04.0.pkg
+          sudo installer -pkg Ghostscript-10.04.0.pkg -target /
+          lipo -thin x86_64 /usr/local/bin/gs -output gs-x86_64-apple-darwin
+
+      - name: Get FFmpeg & Pandoc (Intel)
+        run: |
+          curl -L "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg_intel.zip
+          unzip -q ffmpeg_intel.zip -d ffmpeg_intel
+          mv ffmpeg_intel/ffmpeg ffmpeg-x86_64-apple-darwin
+          
+          curl -L "https://github.com/jgm/pandoc/releases/download/3.6.2/pandoc-3.6.2-x86_64-macOS.zip" -o pandoc_intel.zip
+          unzip -q pandoc_intel.zip -d pandoc_intel
+          mv pandoc_intel/pandoc-*/bin/pandoc pandoc-x86_64-apple-darwin
+
+      - name: Build ImageMagick (Native Intel)
+        run: |
+          curl -L "https://imagemagick.org/archive/ImageMagick.tar.gz" -o im.tar.gz
+          tar -xzf im.tar.gz
+          cd ImageMagick-*
+          ./configure --prefix=/tmp/im-intel --disable-shared --enable-static --without-x --without-magick-plus-plus --without-perl
+          make -j$(sysctl -n hw.ncpu)
+          make install
+          cp /tmp/im-intel/bin/magick ../magick-x86_64-apple-darwin
+          cd ..
+          
+          chmod +x *-apple-darwin
+
+      - name: Upload macOS Intel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-binaries
+          path: '*-x86_64-apple-darwin'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 5. CREATE FINAL GITHUB RELEASE
+  # ═══════════════════════════════════════════════════════════════════════════
+  release:
+    needs: [build-windows, build-linux, build-macos-arm, build-macos-intel]
+    runs-on: ubuntu-latest
+    if: always() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos-arm.result == 'success' && needs.build-macos-intel.result == 'success'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./binaries
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./binaries/*
+          tag_name: all-binaries-v${{ github.run_number }}
+          name: "Filoshi Full App Binaries v${{ github.run_number }}"
+          body: |
+            ## The Ultimate Binary Collection
+            All files are pre-formatted, fully static, and ready to be dropped into `apps/desktop/src-tauri/binaries/`.
+            
+            🚨 **IMPORTANT WINDOWS NOTE:**
+            A file named `gsdll64.dll` is included. You **MUST** put this dll file right next to `gswin64c-x86_64-pc-windows-msvc.exe`, otherwise Ghostscript will crash!
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
