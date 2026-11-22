@@ -1,0 +1,768 @@
+# Builds a portable ImageMagick `magick` for macOS (x86_64 and arm64) without OpenMP.
+#
+# Why: ImageMagick publishes a macOS portable build for arm64 only, and that one links Homebrew's
+# libomp. This workflow repeats the official recipe for both architectures:
+#   - dependencies: ImageMagick/Dependencies `clone-dependencies.sh macos`,
+#     `.github/build/macos-arm64/install.sh` and `.github/build/macos-arm64/build.sh`
+#     (job `build-macos` in that repository's `.github/workflows/main.yml`);
+#   - ImageMagick: ImageMagick/ImageMagick `.github/workflows/release.yml`, job `macos_portable`
+#     (configure, make, `.github/build/shared/create-portable.sh`, `create-sbom.py`).
+# Changes against upstream are marked "DEVIATION" below. The only intended ones: no OpenMP, Ghostscript
+# and FFTW explicitly off, a chosen MACOSX_DEPLOYMENT_TARGET, an Intel runner, and checks.
+#
+# Self-contained on purpose: copy this file to `.github/workflows/` of the repository that runs it.
+# Documentation: README.md next to the original copy of this file.
+
+name: Build portable ImageMagick for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: ImageMagick source tag (ImageMagick/ImageMagick)
+        type: string
+        default: 7.1.2-36
+      dependencies_ref:
+        description: ImageMagick/Dependencies release tag, branch or commit (7.1.2-36 uses 2026.11.16.0952)
+        type: string
+        default: 2026.11.16.0952
+      deployment_target:
+        description: MACOSX_DEPLOYMENT_TARGET for every library and for magick
+        type: string
+        default: '13.0'
+      publish:
+        description: Attach the results to a release of this repository (tag imagemagick-<version>-mac-<n>)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-imagemagick-${{ inputs.version }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: magick ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    # Dependencies take ~18 min on macos-15 (upstream job "macOS arm64 static"); Intel is slower.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+
+    env:
+      IM_VERSION: ${{ inputs.version }}
+      DEPS_REF: ${{ inputs.dependencies_ref }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
+      ARCH: ${{ matrix.arch }}
+      PACKAGE_NAME: ImageMagick-${{ inputs.version }}-portable-Q16-macos-${{ matrix.arch }}-noomp
+      # Fixed by the upstream scripts (build.sh: INSTALL_PREFIX="/tmp/dependencies").
+      DEPS_PREFIX: /tmp/dependencies
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+      GH_TOKEN: ${{ github.token }}
+      # Delegates of the official 7.1.2-36 arm64 portable build (`magick -version`); must match exactly.
+      EXPECTED_DELEGATES: bzlib cairo fontconfig freetype heic jng jp2 jpeg jxl lcms lqr lzma openexr pangocairo png raqm raw rsvg tiff webp xml zip zlib zstd
+
+    steps:
+      - name: Check inputs and runner, write helper scripts
+        # Note for every script below: macOS runners run steps with /bin/bash 3.2 (no mapfile, no
+        # empty arrays under set -u), and with pipefail a `| head` can kill the step through SIGPIPE.
+        run: |
+          set -euo pipefail
+          re_version='^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'
+          re_ref='^[A-Za-z0-9._/-]+$'
+          re_target='^[0-9]+\.[0-9]+(\.[0-9]+)?$'
+          [[ "$IM_VERSION" =~ $re_version ]] || { echo "::error::version '$IM_VERSION' is not like 7.1.2-36"; exit 1; }
+          [[ "$DEPS_REF" =~ $re_ref ]] || { echo "::error::dependencies_ref '$DEPS_REF' has unexpected characters"; exit 1; }
+          [[ "$MACOSX_DEPLOYMENT_TARGET" =~ $re_target ]] || { echo "::error::deployment_target '$MACOSX_DEPLOYMENT_TARGET' is not like 13.0"; exit 1; }
+          host="$(uname -m)"
+          [ "$host" = "$ARCH" ] || { echo "::error::runner is $host, this matrix entry builds $ARCH"; exit 1; }
+          sw_vers
+          xcodebuild -version
+          clang --version
+          echo "Runner image: ${ImageOS:-?} ${ImageVersion:-?}"
+          echo "Homebrew prefix: $(brew --prefix)"
+          for v in CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH SDKROOT CFLAGS CXXFLAGS LDFLAGS; do
+            [ -z "${!v:-}" ] || echo "::warning::$v is set on this runner: ${!v}"
+          done
+
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+
+          # minos.py <target> <file-or-dir>...: the minimum macOS of every Mach-O object (LC_BUILD_VERSION
+          # minos, or LC_VERSION_MIN_MACOSX version) inside static libraries, objects and binaries.
+          # Fails, naming each library and object, when one is above <target>.
+          cat > "$tools/minos.py" <<'PY'
+          import os, subprocess, sys
+
+          def vt(s):
+              parts = [int(p) for p in s.split('.')]
+              while len(parts) < 3:
+                  parts.append(0)
+              return tuple(parts)
+
+          def scan(path):
+              r = subprocess.run(['otool', '-l', path], capture_output=True, text=True)
+              if r.returncode != 0:
+                  return None
+              versions, objects = {}, set()
+              member, expect = os.path.basename(path), None
+              for line in r.stdout.splitlines():
+                  if line and not line[0].isspace() and line.endswith(':') and not line.startswith('Load command'):
+                      member, expect = line[:-1], None
+                      objects.add(member)
+                      continue
+                  f = line.split()
+                  if len(f) >= 2 and f[0] == 'cmd':
+                      expect = {'LC_BUILD_VERSION': 'minos', 'LC_VERSION_MIN_MACOSX': 'version'}.get(f[1])
+                      continue
+                  if expect and len(f) >= 2 and f[0] == expect:
+                      versions[member] = f[1]
+                      expect = None
+              return versions, objects
+
+          def main():
+              target, given = sys.argv[1], sys.argv[2:]
+              files, explicit, seen = [], set(), set()
+              for p in given:
+                  if os.path.isdir(p):
+                      for root, _, names in os.walk(p):
+                          for n in sorted(names):
+                              if n.endswith(('.a', '.o', '.dylib')):
+                                  files.append(os.path.join(root, n))
+                  else:
+                      files.append(p)
+                      explicit.add(p)
+              bad, overall, failed = [], None, False
+              for path in files:
+                  real = os.path.realpath(path)
+                  if real in seen:
+                      continue
+                  seen.add(real)
+                  res = scan(path)
+                  if res is None:
+                      print(f'  (not Mach-O)  {path}')
+                      if path in explicit:
+                          print(f'::error::otool cannot read {path}')
+                          failed = True
+                      continue
+                  versions, objects = res
+                  if not versions:
+                      print(f'  (no version)  {path}  ({len(objects)} objects, e.g. nasm output)')
+                      if path in explicit:
+                          print(f'::error::{path} has no LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX')
+                          failed = True
+                      continue
+                  top = max(versions.values(), key=vt)
+                  overall = top if overall is None or vt(top) > vt(overall) else overall
+                  unversioned = max(len(objects) - len(versions), 0)
+                  print(f'  {top:>8}  {path}' + (f'  ({unversioned} objects without a version)' if unversioned else ''))
+                  for m, v in sorted(versions.items()):
+                      if vt(v) > vt(target):
+                          bad.append((path, m, v))
+              print(f'MAX_MINOS={overall or "none"}')
+              if bad:
+                  libs = sorted({os.path.basename(p) for p, _, _ in bad})
+                  for p, m, v in bad[:200]:
+                      print(f'  above target: {m} -> macOS {v}')
+                  print(f'::error::{len(bad)} object(s) need a newer macOS than the requested {target}, in: {", ".join(libs)}')
+                  failed = True
+              sys.exit(1 if failed else 0)
+
+          main()
+          PY
+
+          # hide-homebrew-libs.sh: on Intel, Homebrew lives in /usr/local, whose lib/ and include/ are on
+          # clang's and ld's DEFAULT search paths; on Apple Silicon (/opt/homebrew, where the official build
+          # runs) they are not. Moving the libraries and headers out of /usr/local/{lib,include} gives the
+          # Intel build the same view as upstream's arm64 build, so autotools/meson checks cannot pick up a
+          # runner library (gettext's libintl, gmp, lz4, ...). Binaries and pkg-config files stay, exactly
+          # as on arm64; Homebrew programs keep working because they load libraries through /usr/local/opt.
+          cat > "$tools/hide-homebrew-libs.sh" <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          prefix="$(brew --prefix)"
+          if [ "$prefix" != "/usr/local" ]; then
+            echo "Homebrew is in $prefix (not on the default compiler search path): nothing to hide."
+            exit 0
+          fi
+          stash="$RUNNER_TEMP/hidden-usr-local/$(date +%Y%m%d%H%M%S)-$$"
+          mkdir -p "$stash/lib" "$stash/include"
+          shopt -s nullglob
+          n=0
+          hide() {
+            # Homebrew's files belong to the runner user; anything installed as root needs sudo.
+            if mv "$1" "$2" 2>/dev/null || sudo mv "$1" "$2"; then
+              n=$((n + 1))
+            else
+              echo "::warning::could not move $1 out of the default search path"
+            fi
+          }
+          for f in /usr/local/lib/*.dylib /usr/local/lib/*.a /usr/local/lib/*.la /usr/local/lib/*.tbd; do
+            hide "$f" "$stash/lib/"
+          done
+          for f in /usr/local/include/*; do
+            hide "$f" "$stash/include/"
+          done
+          echo "Moved $n entries from /usr/local/lib and /usr/local/include to $stash"
+          ls "$stash/lib" | sed -n '1,300s/^/  lib: /p'
+          SH
+          chmod +x "$tools/hide-homebrew-libs.sh"
+          echo "TOOLS=$tools" >> "$GITHUB_ENV"
+
+      - name: Check out ImageMagick ${{ inputs.version }}
+        uses: actions/checkout@v7
+        with:
+          repository: ImageMagick/ImageMagick
+          ref: ${{ inputs.version }}
+          path: ImageMagick
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out ImageMagick/Dependencies ${{ inputs.dependencies_ref }}
+        uses: actions/checkout@v7
+        with:
+          repository: ImageMagick/Dependencies
+          ref: ${{ inputs.dependencies_ref }}
+          path: deps-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve versions and the cache key
+        id: meta
+        run: |
+          set -euo pipefail
+          # Same extraction as upstream's "Set version" job (grep -P is not on macOS, so sed).
+          configured="$(sed -n "s/^PACKAGE_VERSION='\([0-9.-]*\)'.*/\1/p" ImageMagick/configure | sed -n 1p)"
+          [ "$configured" = "$IM_VERSION" ] || { echo "::error::ImageMagick/configure says $configured, input says $IM_VERSION"; exit 1; }
+          im_sha="$(git -C ImageMagick rev-parse HEAD)"
+          im_time="$(TZ=UTC git -C ImageMagick log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)"
+          deps_sha="$(git -C deps-src rev-parse HEAD)"
+          # The Dependencies release this ImageMagick tag was built with upstream.
+          upstream_deps="$(sed -n 's/^download_dependencies "\([^"]*\)".*/\1/p' ImageMagick/.github/build/shared/download-dependencies.sh || true)"
+          if [ -n "$upstream_deps" ] && [ "$upstream_deps" != "$DEPS_REF" ]; then
+            echo "::warning::ImageMagick $IM_VERSION was released with Dependencies $upstream_deps, this run uses $DEPS_REF"
+          fi
+          xcode="$(xcodebuild -version | tr '\n' ' ' | sed 's/[^A-Za-z0-9.]/-/g')"
+          key="im-deps-v1-$ARCH-$MACOSX_DEPLOYMENT_TARGET-$deps_sha-${ImageOS:-macos}-$xcode"
+          {
+            echo "im_sha=$im_sha"
+            echo "im_time=$im_time"
+            echo "deps_sha=$deps_sha"
+            echo "upstream_deps=$upstream_deps"
+            echo "cache_key=$key"
+          } >> "$GITHUB_OUTPUT"
+          echo "ImageMagick $IM_VERSION = $im_sha ($im_time)"
+          echo "Dependencies $DEPS_REF = $deps_sha (upstream used: ${upstream_deps:-unknown})"
+          echo "Cache key: $key"
+
+      - name: Restore the dependency tree from the cache
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: /tmp/dependencies
+          key: ${{ steps.meta.outputs.cache_key }}
+
+      # Upstream's macos_portable job downloads this zip. It is reused only when every object in it is
+      # built for the requested target or older (the 2026.11.16.0952 zip is built for macOS 15.0, so the
+      # default target 13.0 always rebuilds).
+      - name: Try the official prebuilt macos-arm64-static.zip
+        id: prebuilt
+        if: matrix.arch == 'arm64' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          echo "used=false" >> "$GITHUB_OUTPUT"
+          digest="$(gh api "repos/ImageMagick/Dependencies/releases/tags/$DEPS_REF" \
+            --jq '.assets[] | select(.name == "macos-arm64-static.zip") | (.digest // "none")' 2>/dev/null || true)"
+          if [ -z "$digest" ]; then
+            echo "Dependencies $DEPS_REF is not a release with macos-arm64-static.zip: building from source."
+            exit 0
+          fi
+          dir="$RUNNER_TEMP/prebuilt"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 "https://github.com/ImageMagick/Dependencies/releases/download/$DEPS_REF/macos-arm64-static.zip" -o "$dir/deps.zip"
+          got="sha256:$(shasum -a 256 "$dir/deps.zip" | cut -d' ' -f1)"
+          if [ "$digest" = "none" ]; then
+            echo "::warning::GitHub has no digest for macos-arm64-static.zip; downloaded $got"
+          else
+            [ "$got" = "$digest" ] || { echo "::error::macos-arm64-static.zip is $got, GitHub says $digest"; exit 1; }
+          fi
+          # Upstream's download-dependencies.sh also accepts unzip's exit code 1 (warnings).
+          unzip -q -o "$dir/deps.zip" -d "$dir/x" || [ $? -eq 1 ]
+          if python3 -I "$TOOLS/minos.py" "$MACOSX_DEPLOYMENT_TARGET" "$dir/x/lib"; then
+            mkdir -p "$DEPS_PREFIX"
+            mv "$dir/x/lib" "$dir/x/include" "$DEPS_PREFIX/"
+            [ ! -f "$dir/x/sbom.json" ] || cp "$dir/x/sbom.json" "$DEPS_PREFIX/sbom.json"
+            printf 'prebuilt %s (%s)\n' "macos-arm64-static.zip of Dependencies $DEPS_REF" "$got" > "$DEPS_PREFIX/SOURCE.txt"
+            echo "used=true" >> "$GITHUB_OUTPUT"
+            echo "Using the official prebuilt dependencies."
+          else
+            echo "::notice::The official macos-arm64-static.zip needs a newer macOS than $MACOSX_DEPLOYMENT_TARGET: building the dependencies instead."
+          fi
+
+      - name: Build the dependencies (official scripts)
+        if: steps.cache.outputs.cache-hit != 'true' && steps.prebuilt.outputs.used != 'true'
+        working-directory: deps-src
+        run: |
+          set -euo pipefail
+          # Upstream order (Dependencies main.yml, job build-macos): clone, install tools, build.
+          # clone-dependencies.sh starts with "#/bin/bash" (no valid shebang), so run it with bash.
+          bash ./clone-dependencies.sh macos
+
+          inst=".github/build/macos-arm64/install.sh"
+          # DEVIATION: install.sh exits when one of the libraries in its `packages` list is installed by
+          # Homebrew, and its `brew uninstall` lines fail when a package is absent. The Intel image is not
+          # guaranteed to match the arm64 image upstream runs on, so: remove listed libraries that are
+          # present (same intent as the script), and let a missing package pass. The check itself stays.
+          listed="$(sed -n '/^packages=(/,/^)/p' "$inst" | grep -oE '"[^"]+"' | tr -d '"')"
+          [ -n "$listed" ] || { echo "::error::could not read the packages list from $inst"; exit 1; }
+          installed="$(brew list --formula -1)"
+          for p in $listed; do
+            if printf '%s\n' "$installed" | grep -qx "$p"; then
+              echo "::warning::Homebrew $p is installed on this runner; removing it as install.sh requires"
+              brew uninstall --ignore-dependencies "$p"
+            fi
+          done
+          sed -E 's/^(brew uninstall .+)$/\1 || echo "(brew uninstall failed: not installed, continuing)"/' "$inst" > "$RUNNER_TEMP/install.sh"
+          diff -u "$inst" "$RUNNER_TEMP/install.sh" || true
+          bash "$RUNNER_TEMP/install.sh"
+
+          # DEVIATION (Intel only, no-op on arm64): see hide-homebrew-libs.sh in the first step.
+          "$TOOLS/hide-homebrew-libs.sh"
+
+          # The folder is named macos-arm64 but nothing in build.sh or the shared scripts is arm64-only:
+          # aom is built with AOM_TARGET_CPU=generic, libjpeg-turbo's and openh264's x86 assembly use the
+          # nasm that install.sh installs. MACOSX_DEPLOYMENT_TARGET (job env) is read by clang for
+          # autotools and meson builds and initialises CMAKE_OSX_DEPLOYMENT_TARGET for CMake builds;
+          # build.sh sets CFLAGS itself (FLAGS), so the environment variable is the only lever.
+          echo "Building with MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+          log="$RUNNER_TEMP/dependencies-build.log"
+          set +e
+          ./.github/build/macos-arm64/build.sh 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            lib="$(grep -oE '(NonWindows)?Dependencies/[A-Za-z0-9_.+-]+' "$log" | tail -n 1 || true)"
+            need="$(grep -oE 'introduced in macOS [0-9.]+' "$log" | sort -u | tr '\n' ' ' || true)"
+            if [ -n "$need" ]; then
+              echo "::error::A dependency (last one in the log: ${lib:-unknown}) uses an API that is not available on macOS $MACOSX_DEPLOYMENT_TARGET (${need}). Raise deployment_target to that version or newer."
+            else
+              echo "::error::build.sh failed (exit $status); last library in the log: ${lib:-unknown}"
+            fi
+            exit "$status"
+          fi
+
+          # Upstream: python3 .github/build/shared/generate-sbom.py Artifacts/sbom.json
+          mkdir -p Artifacts
+          python3 .github/build/shared/generate-sbom.py Artifacts/sbom.json
+          cp Artifacts/sbom.json "$DEPS_PREFIX/sbom.json"
+          printf 'built on %s %s from Dependencies %s (%s), MACOSX_DEPLOYMENT_TARGET=%s\n' \
+            "${ImageOS:-?}" "${ImageVersion:-?}" "$DEPS_REF" "$(git rev-parse HEAD)" "$MACOSX_DEPLOYMENT_TARGET" > "$DEPS_PREFIX/SOURCE.txt"
+
+      - name: Check the dependencies (minimum macOS, foreign paths)
+        id: depcheck
+        run: |
+          set -euo pipefail
+          [ -d "$DEPS_PREFIX/lib" ] || { echo "::error::no dependency tree in $DEPS_PREFIX"; exit 1; }
+          cat "$DEPS_PREFIX/SOURCE.txt" || true
+          echo "Minimum macOS per static library (requested: $MACOSX_DEPLOYMENT_TARGET):"
+          out="$(python3 -I "$TOOLS/minos.py" "$MACOSX_DEPLOYMENT_TARGET" "$DEPS_PREFIX/lib")" || { echo "$out"; exit 1; }
+          echo "$out"
+          echo "max_minos=$(printf '%s\n' "$out" | sed -n 's/^MAX_MINOS=//p')" >> "$GITHUB_OUTPUT"
+          # A .pc file that mentions Homebrew means a runner library leaked into a dependency; the link of
+          # magick would then pull it in. The otool check after the build is the hard gate.
+          leaks="$(grep -lE '/opt/homebrew|/usr/local' "$DEPS_PREFIX"/lib/pkgconfig/*.pc || true)"
+          if [ -n "$leaks" ]; then
+            echo "::warning::pkg-config files mention Homebrew paths: $(echo "$leaks" | xargs -n1 basename | tr '\n' ' ')"
+            grep -nE '/opt/homebrew|/usr/local' $leaks || true
+          fi
+          dylibs="$(find "$DEPS_PREFIX/lib" -name '*.dylib' | sed -n '1,20p')"
+          [ -z "$dylibs" ] || echo "::warning::shared libraries in the dependency tree (magick must link statically): $dylibs"
+
+      # actions/cache compresses with zstd when the `zstd` program exists and with gzip otherwise, and
+      # the compression method is part of the cache version. install.sh uninstalls Homebrew's zstd, but
+      # the restore step of the next run sees the image's zstd: without it here, every save would be
+      # gzip and every later restore a miss.
+      - name: Put the zstd program back for the cache
+        if: steps.cache.outputs.cache-hit != 'true' && steps.prebuilt.outputs.used != 'true'
+        run: |
+          set -euo pipefail
+          command -v zstd || brew install zstd
+          zstd --version
+
+      - name: Save the dependency tree to the cache
+        if: steps.cache.outputs.cache-hit != 'true' && steps.prebuilt.outputs.used != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: /tmp/dependencies
+          key: ${{ steps.meta.outputs.cache_key }}
+
+      - name: Install ImageMagick build tools
+        run: |
+          set -euo pipefail
+          # Upstream: brew install autoconf automake libtool libomp pkgconf xz
+          # DEVIATION: no libomp (no OpenMP); no xz: macOS tar writes .tar.xz itself, and Homebrew's
+          # liblzma would sit on the Intel default library path next to the static one.
+          brew install autoconf automake libtool pkgconf
+          "$TOOLS/hide-homebrew-libs.sh"
+
+      - name: Configure ImageMagick
+        working-directory: ImageMagick
+        env:
+          CC: clang
+          CXX: clang++
+          PKG_CONFIG_LIBDIR: /tmp/dependencies/lib/pkgconfig
+          PKG_CONFIG: pkg-config --static
+        run: |
+          set -euo pipefail
+          unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH
+          export CFLAGS="-O3"
+          export CXXFLAGS="$CFLAGS"
+          # DEVIATION: upstream adds "-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include" here,
+          # "-L<libomp>/lib -Wl,-rpath,<libomp>/lib" to LDFLAGS and LIBS="-lomp"; all dropped.
+          export CPPFLAGS="-I/tmp/dependencies/include"
+          export LDFLAGS="-L/tmp/dependencies/lib"
+          # Upstream line (Q16, hdri=no):
+          #   ./configure --prefix=/usr --disable-installed --disable-shared --enable-static --without-modules
+          #     --without-magick-plus-plus --without-perl --without-x --with-rsvg --with-quantum-depth=16 --enable-hdri=no
+          # DEVIATION: + --disable-openmp, and Ghostscript (AGPL) and FFTW (GPL) explicitly off. Neither is
+          # in the dependency tree, so this changes nothing upstream links; it only makes sure a runner copy
+          # can never be picked up.
+          args=(--prefix=/usr --disable-installed --disable-shared --enable-static --without-modules
+                --without-magick-plus-plus --without-perl --without-x --with-rsvg --with-quantum-depth=16 --enable-hdri=no
+                --disable-openmp --without-gslib --without-fftw)
+          {
+            echo "CC=$CC CXX=$CXX"
+            echo "CFLAGS=$CFLAGS CXXFLAGS=$CXXFLAGS"
+            echo "CPPFLAGS=$CPPFLAGS"
+            echo "LDFLAGS=$LDFLAGS"
+            echo "PKG_CONFIG_LIBDIR=$PKG_CONFIG_LIBDIR PKG_CONFIG=$PKG_CONFIG"
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+            echo "./configure ${args[*]}"
+          } > "$RUNNER_TEMP/configure-line.txt"
+          cat "$RUNNER_TEMP/configure-line.txt"
+          ./configure "${args[@]}"
+
+      - name: Build ImageMagick
+        working-directory: ImageMagick
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/imagemagick-build.log"
+          set +e
+          make -j"$(sysctl -n hw.logicalcpu)" 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          [ "$status" -eq 0 ] || exit "$status"
+          make install DESTDIR="$PWD/portable"
+          # The linker sets magick's own minimum to MACOSX_DEPLOYMENT_TARGET even when an object needs a
+          # newer macOS; it only warns. Treat that warning as an error.
+          if grep -E 'built for newer .*macOS.* version' "$log"; then
+            echo "::error::objects linked into magick need a newer macOS than $MACOSX_DEPLOYMENT_TARGET (see the lines above)"
+            exit 1
+          fi
+
+      - name: Assemble the portable folder and sign magick
+        run: |
+          set -euo pipefail
+          # Same layout as upstream's .github/build/shared/create-portable.sh.
+          src="$GITHUB_WORKSPACE/ImageMagick"
+          pkg="$RUNNER_TEMP/out/$PACKAGE_NAME"
+          mkdir -p "$pkg/bin" "$pkg/etc" "$pkg/share"
+          cp "$src/portable/usr/bin/magick" "$pkg/bin/"
+          cp -a "$src/portable/usr/etc/ImageMagick-7" "$pkg/etc/"
+          cp -a "$src/portable/usr/share/ImageMagick-7" "$pkg/share/"
+          cp "$src"/portable/usr/lib/ImageMagick-*/config-*/configure.xml "$pkg/etc/ImageMagick-7/"
+          cp "$src/LICENSE" "$pkg/"
+          cp "$src/config/sRGB.icm" "$pkg/sRGB.icc"
+          # DEVIATION: upstream generates ChangeLog.md with auto-changelog over the full git history in a
+          # separate job; the same file ships in the release's source archive, so take it from there.
+          if curl -fsSL --retry 3 "https://github.com/ImageMagick/ImageMagick/releases/download/$IM_VERSION/ImageMagick-$IM_VERSION.tar.xz" -o "$RUNNER_TEMP/src.tar.xz" \
+             && tar -xJf "$RUNNER_TEMP/src.tar.xz" -C "$RUNNER_TEMP" "ImageMagick-$IM_VERSION/ChangeLog.md"; then
+            cp "$RUNNER_TEMP/ImageMagick-$IM_VERSION/ChangeLog.md" "$pkg/ChangeLog.md"
+          else
+            echo "::warning::no ChangeLog.md in the release source archive; the package has none"
+          fi
+          codesign --force --sign - "$pkg/bin/magick"
+          codesign --verify --strict --verbose=2 "$pkg/bin/magick"
+          codesign -dv "$pkg/bin/magick" 2>&1 | sed 's/^/  /'
+          echo "PKG=$pkg" >> "$GITHUB_ENV"
+          find "$pkg" -type f | sort
+
+      - name: Self-checks
+        id: checks
+        run: |
+          set -euo pipefail
+          bin="$PKG/bin/magick"
+          fail() { echo "::error::$*"; exit 1; }
+
+          # Run the checks without the build tree: whatever magick reads from /tmp/dependencies at run time
+          # would be missing on a user's Mac too.
+          mv "$DEPS_PREFIX" "$DEPS_PREFIX-hidden-during-checks"
+
+          echo "== architecture"
+          archs="$(lipo -archs "$bin")"
+          echo "$archs"
+          [ "$archs" = "$ARCH" ] || fail "lipo -archs says '$archs', expected '$ARCH'"
+
+          echo "== linked libraries"
+          otool -L "$bin"
+          foreign="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/Library/)' || true)"
+          [ -z "$foreign" ] || fail "magick links libraries outside /usr/lib and /System/Library: $(echo $foreign)"
+          rpaths="$(otool -l "$bin" | awk '/cmd LC_RPATH/{getline; getline; print $2}')"
+          [ -z "$rpaths" ] || fail "magick has LC_RPATH entries: $(echo $rpaths)"
+
+          echo "== minimum macOS"
+          vtool -show-build "$bin" || true
+          out="$(python3 -I "$TOOLS/minos.py" "$MACOSX_DEPLOYMENT_TARGET" "$bin")" || { echo "$out"; fail "magick's minimum macOS is above $MACOSX_DEPLOYMENT_TARGET"; }
+          echo "$out"
+          minos="$(printf '%s\n' "$out" | sed -n 's/^MAX_MINOS=//p')"
+          echo "minos=$minos" >> "$GITHUB_OUTPUT"
+
+          echo "== signature"
+          codesign --verify --strict --verbose=2 "$bin"
+
+          # The app copies magick and every XML file into one folder and sets these variables
+          # (MAGICK_CONFIGURE_PATH = the binary's own folder); test exactly that layout.
+          app="$RUNNER_TEMP/app-layout"
+          mkdir -p "$app"
+          cp "$bin" "$app/magick"
+          cp "$PKG"/etc/ImageMagick-7/*.xml "$PKG"/share/ImageMagick-7/*.xml "$app/"
+          export MAGICK_HOME="$app" MAGICK_CONFIGURE_PATH="$app" MAGICK_CODER_MODULE_PATH="$app"
+          m() { "$app/magick" "$@"; }
+
+          echo "== version"
+          ver="$(m -version)"
+          echo "$ver"
+          printf '%s\n' "$ver" | grep -q "ImageMagick $IM_VERSION Q16 " || fail "-version does not say ImageMagick $IM_VERSION Q16"
+          features="$(printf '%s\n' "$ver" | sed -n 's/^Features: *//p')"
+          case " $features " in *OpenMP*) fail "OpenMP is still enabled: $features";; esac
+          case " $features " in *HDRI*) fail "HDRI is enabled; the official Q16 build has none: $features";; esac
+          got="$(printf '%s\n' "$ver" | sed -n 's/^Delegates (built-in): *//p' | tr ' ' '\n' | sed '/^$/d' | sort)"
+          want="$(printf '%s\n' $EXPECTED_DELEGATES | sort)"
+          missing="$(comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$got") | tr '\n' ' ')"
+          extra="$(comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$got") | tr '\n' ' ')"
+          [ -z "${missing// /}" ] || fail "delegates missing: $missing"
+          [ -z "${extra// /}" ] || fail "unexpected delegates (not in the official build): $extra"
+          delegates="$(printf '%s\n' "$ver" | sed -n 's/^Delegates (built-in): *//p')"
+          echo "delegates=$delegates" >> "$GITHUB_OUTPUT"
+          echo "features=$features" >> "$GITHUB_OUTPUT"
+
+          echo "== configuration files"
+          conf="$(m -list configure)"
+          printf '%s\n' "$conf" | sed -n '1,3p'
+          printf '%s\n' "$conf" | sed -n '1,3p' | grep -q "$app" || echo "::warning::-list configure does not show the app folder as the configure.xml path"
+
+          echo "== formats"
+          formats="$(m -list format)"
+          for f in HEIC AVIF JXL WEBP SVG DNG PDF PNG JPEG TIFF; do
+            line="$(printf '%s\n' "$formats" | grep -E "^ *$f\*? " | head -n 1 || true)"
+            [ -n "$line" ] || fail "-list format has no $f"
+            echo "$line"
+          done
+          printf '%s\n' "$formats" | grep -E '^ *SVG\*? ' | grep -q 'RSVG' || fail "SVG is not read through librsvg"
+
+          echo "== conversions"
+          work="$RUNNER_TEMP/conv"
+          mkdir -p "$work"
+          cd "$work"
+          m -size 64x64 gradient:red-blue base.png
+          for ext in png jpg webp avif jxl tiff; do
+            m base.png "t.$ext"
+            m "t.$ext" "back-$ext.png"
+            dims="$(m identify -format '%w %h' "back-$ext.png")"
+            [ "$dims" = "64 64" ] || fail "$ext round trip gave $dims"
+            echo "  $ext: $(wc -c < "t.$ext" | tr -d ' ') bytes, back to PNG 64x64"
+          done
+          # The files are what they claim (not silently written in another format).
+          python3 -I - <<'PY' || fail "a written file has the wrong signature"
+          import sys
+          def head(p, n=16):
+              with open(p, 'rb') as f:
+                  return f.read(n)
+          checks = {
+              't.png': lambda b: b.startswith(b'\x89PNG\r\n\x1a\n'),
+              't.jpg': lambda b: b.startswith(b'\xff\xd8\xff'),
+              't.webp': lambda b: b[:4] == b'RIFF' and b[8:12] == b'WEBP',
+              't.avif': lambda b: b[4:8] == b'ftyp' and b[8:12] in (b'avif', b'avis'),
+              't.jxl': lambda b: b.startswith(b'\xff\x0a') or b.startswith(b'\x00\x00\x00\x0cJXL '),
+              't.tiff': lambda b: b[:4] in (b'II*\x00', b'MM\x00*', b'II+\x00', b'MM\x00+'),
+          }
+          bad = [p for p, ok in checks.items() if not ok(head(p))]
+          for p in bad:
+              print(f'{p}: unexpected header {head(p)!r}')
+          sys.exit(1 if bad else 0)
+          PY
+          for ext in png tiff; do
+            a="$(m identify -format '%#' base.png)"
+            b="$(m identify -format '%#' "back-$ext.png")"
+            [ "$a" = "$b" ] || fail "lossless $ext round trip changed the pixels"
+          done
+          m base.png t.pdf
+          [ "$(head -c 4 t.pdf)" = "%PDF" ] || fail "PDF output is not a PDF"
+
+          echo "== SVG"
+          cat > shapes.svg <<'SVG'
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="48" viewBox="0 0 64 48">
+            <rect width="64" height="48" fill="#3366cc"/>
+            <circle cx="32" cy="24" r="14" fill="#ffcc00"/>
+          </svg>
+          SVG
+          m shapes.svg svg.png
+          [ "$(m identify -format '%w %h' svg.png)" = "64 48" ] || fail "SVG rendered at the wrong size"
+          rgb() { m svg.png -format "%[fx:round(255*p{$1}.r)],%[fx:round(255*p{$1}.g)],%[fx:round(255*p{$1}.b)]" info:; }
+          centre="$(rgb 32,24)"
+          corner="$(rgb 2,2)"
+          echo "  centre $centre, corner $corner"
+          [ "$centre" = "255,204,0" ] || fail "SVG centre pixel is $centre, expected 255,204,0 (the yellow circle)"
+          [ "$corner" = "51,102,204" ] || fail "SVG corner pixel is $corner, expected 51,102,204 (the blue background)"
+          # Text goes through pango + fontconfig, whose config file is not shipped (as upstream): warn only.
+          cat > text.svg <<'SVG'
+          <svg xmlns="http://www.w3.org/2000/svg" width="80" height="24"><text x="2" y="18" font-family="Helvetica" font-size="16">Hello</text></svg>
+          SVG
+          if m text.svg text.png 2> text.err; then echo "  SVG with text: ok"; else echo "::warning::SVG with text failed: $(cat text.err)"; fi
+          [ ! -s text.err ] || { echo "  stderr of the text test:"; sed 's/^/    /' text.err; }
+
+          mv "$DEPS_PREFIX-hidden-during-checks" "$DEPS_PREFIX"
+          echo "All checks passed."
+
+      - name: Pack, checksum, SBOM and build info
+        env:
+          IM_SHA: ${{ steps.meta.outputs.im_sha }}
+          IM_TIME: ${{ steps.meta.outputs.im_time }}
+          DEPS_SHA: ${{ steps.meta.outputs.deps_sha }}
+          MAGICK_MINOS: ${{ steps.checks.outputs.minos }}
+          DEPS_MAX_MINOS: ${{ steps.depcheck.outputs.max_minos }}
+          DELEGATES: ${{ steps.checks.outputs.delegates }}
+          FEATURES: ${{ steps.checks.outputs.features }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          sha_bin="$(shasum -a 256 "$PKG/bin/magick" | cut -d' ' -f1)"
+          info="$out/$PACKAGE_NAME.BUILD-INFO.txt"
+          {
+            echo "Package:              $PACKAGE_NAME"
+            echo "ImageMagick source:   https://github.com/ImageMagick/ImageMagick tag $IM_VERSION (commit $IM_SHA)"
+            echo "Dependencies:         https://github.com/ImageMagick/Dependencies ref $DEPS_REF (commit $DEPS_SHA)"
+            echo "Dependencies source:  $(cat "$DEPS_PREFIX/SOURCE.txt" 2>/dev/null || echo unknown)"
+            echo "Deployment target:    $MACOSX_DEPLOYMENT_TARGET (magick minos $MAGICK_MINOS, highest library minos $DEPS_MAX_MINOS)"
+            echo "Architecture:         $ARCH"
+            echo "Delegates:            $DELEGATES"
+            echo "Features:             $FEATURES"
+            echo "SHA-256 of bin/magick: $sha_bin (ad-hoc signed)"
+            echo "Runner image:         ${ImageOS:-?} ${ImageVersion:-?}, $(sw_vers -productName) $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+            echo "Xcode:                $(xcodebuild -version | tr '\n' ' ')"
+            echo "Workflow run:         $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "Built:                $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "Configure:"
+            sed 's/^/  /' "$RUNNER_TEMP/configure-line.txt"
+            echo
+            echo "No OpenMP, no Ghostscript, no FFTW. Every library is linked statically; magick links only"
+            echo "/usr/lib and /System/Library. Licenses: LICENSE (ImageMagick) and the CycloneDX SBOM"
+            echo "$PACKAGE_NAME.cdx.json (one component per bundled library)."
+          } > "$info"
+          cp "$info" "$PKG/BUILD-INFO.txt"
+          cat "$info"
+
+          # Upstream: COPYFILE_DISABLE=1 XZ_OPT="-9e" tar -cJf ... with Homebrew xz installed. macOS tar
+          # compresses with its own liblzma and ignores XZ_OPT, so ask it for level 9 directly.
+          cd "$out"
+          COPYFILE_DISABLE=1 tar --options xz:compression-level=9 -cJf "$PACKAGE_NAME.tar.xz" "$PACKAGE_NAME"
+          shasum -a 256 "$PACKAGE_NAME.tar.xz" > "$PACKAGE_NAME.tar.xz.sha256"
+          cat "$PACKAGE_NAME.tar.xz.sha256"
+
+          # Upstream: create-sbom.py fills the Dependencies sbom.json with ImageMagick's version and commit.
+          if [ -f "$DEPS_PREFIX/sbom.json" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/ImageMagick/Artifacts"
+            cp "$DEPS_PREFIX/sbom.json" "$GITHUB_WORKSPACE/ImageMagick/Artifacts/sbom.json"
+            ( cd "$GITHUB_WORKSPACE/ImageMagick" && \
+              MAGICK_COMMIT="$IM_SHA" MAGICK_TIMESTAMP="$IM_TIME" MAGICK_VERSION="$IM_VERSION" \
+              python3 .github/build/shared/create-sbom.py "$out/$PACKAGE_NAME.cdx.json" )
+          else
+            echo "::warning::no Dependencies sbom.json, so no SBOM"
+          fi
+
+          # The archive unpacks to the same magick.
+          check="$RUNNER_TEMP/unpack-check"
+          mkdir -p "$check"
+          tar -xJf "$PACKAGE_NAME.tar.xz" -C "$check"
+          [ "$(shasum -a 256 "$check/$PACKAGE_NAME/bin/magick" | cut -d' ' -f1)" = "$sha_bin" ] || { echo "::error::packed magick differs"; exit 1; }
+          [ -x "$check/$PACKAGE_NAME/bin/magick" ] || { echo "::error::packed magick is not executable"; exit 1; }
+          tar -tJf "$PACKAGE_NAME.tar.xz"
+          ls -l "$out"
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            ${{ runner.temp }}/out/*.tar.xz
+            ${{ runner.temp }}/out/*.sha256
+            ${{ runner.temp }}/out/*.BUILD-INFO.txt
+            ${{ runner.temp }}/out/*.cdx.json
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Attach to a release
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      IM_VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download the build results
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: ImageMagick-*-macos-*-noomp
+          merge-multiple: true
+
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          ls -l dist
+          n=1
+          while IFS= read -r ref; do
+            s="${ref##*-mac-}"
+            if [[ "$s" =~ ^[0-9]+$ ]] && (( s >= n )); then n=$((s + 1)); fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/imagemagick-$IM_VERSION-mac-" --jq '.[].ref' || true)
+          tag="imagemagick-$IM_VERSION-mac-$n"
+          {
+            echo "Portable ImageMagick $IM_VERSION for macOS without OpenMP, built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+            for f in dist/*.BUILD-INFO.txt; do
+              echo
+              echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } > notes.md
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "ImageMagick $IM_VERSION for macOS (no OpenMP) #$n" \
+            --notes-file notes.md
+          echo "Release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag" | tee -a "$GITHUB_STEP_SUMMARY"
